@@ -1,0 +1,147 @@
+CREATE TABLE IF NOT EXISTS prototype_game_states (
+  session_id text PRIMARY KEY,
+  version integer NOT NULL,
+  state jsonb NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS prototype_game_actions (
+  action_id uuid PRIMARY KEY,
+  session_id text NOT NULL REFERENCES prototype_game_states(session_id) ON DELETE CASCADE,
+  response jsonb NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS prototype_game_actions_session_idx ON prototype_game_actions(session_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS anonymous_sessions (
+  id uuid PRIMARY KEY, nickname text,
+  created_at timestamptz NOT NULL DEFAULT now(), last_seen_at timestamptz NOT NULL DEFAULT now(),
+  CHECK (nickname IS NULL OR char_length(nickname) BETWEEN 1 AND 16)
+);
+CREATE TABLE IF NOT EXISTS matchmaking_rooms (
+  id uuid PRIMARY KEY, name text NOT NULL,
+  host_session_id uuid NOT NULL REFERENCES anonymous_sessions(id),
+  status text NOT NULL DEFAULT 'WAITING' CHECK (status IN ('WAITING','STARTED','FINISHED')),
+  max_players integer NOT NULL DEFAULT 8 CHECK (max_players BETWEEN 2 AND 8),
+  version integer NOT NULL DEFAULT 1, created_at timestamptz NOT NULL DEFAULT now(),
+  started_at timestamptz, finished_at timestamptz
+);
+CREATE TABLE IF NOT EXISTS matchmaking_room_players (
+  room_id uuid NOT NULL REFERENCES matchmaking_rooms(id) ON DELETE CASCADE,
+  session_id uuid NOT NULL REFERENCES anonymous_sessions(id), nickname_snapshot text NOT NULL,
+  seat integer NOT NULL CHECK (seat BETWEEN 0 AND 7), ready boolean NOT NULL DEFAULT false,
+  joined_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY (room_id,session_id), UNIQUE (room_id,seat)
+);
+CREATE TABLE IF NOT EXISTS completed_game_records (
+  id uuid PRIMARY KEY, room_id uuid NOT NULL UNIQUE, room_name text NOT NULL,
+  started_at timestamptz NOT NULL, ended_at timestamptz NOT NULL DEFAULT now(), rounds integer NOT NULL,
+  winner_nickname text, player_nicknames jsonb NOT NULL, summary jsonb NOT NULL, ledger jsonb NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS online_games (
+  id uuid PRIMARY KEY,
+  room_id uuid NOT NULL UNIQUE REFERENCES matchmaking_rooms(id),
+  phase text NOT NULL DEFAULT 'SHOP' CHECK (phase IN ('SHOP','COMBAT','RESULT','GAME_OVER')),
+  round integer NOT NULL DEFAULT 1 CHECK (round > 0),
+  phase_version integer NOT NULL DEFAULT 1,
+  transition_owner uuid,
+  phase_ends_at timestamptz NOT NULL,
+  seed text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  finished_at timestamptz
+);
+
+CREATE TABLE IF NOT EXISTS online_game_players (
+  game_id uuid NOT NULL REFERENCES online_games(id) ON DELETE CASCADE,
+  session_id uuid NOT NULL REFERENCES anonymous_sessions(id),
+  nickname_snapshot text NOT NULL,
+  seat integer NOT NULL CHECK (seat BETWEEN 0 AND 7),
+  hp integer NOT NULL DEFAULT 100 CHECK (hp BETWEEN 0 AND 100),
+  gold integer NOT NULL DEFAULT 8 CHECK (gold >= 0),
+  level integer NOT NULL DEFAULT 3 CHECK (level BETWEEN 1 AND 9),
+  wins integer NOT NULL DEFAULT 0,
+  losses integer NOT NULL DEFAULT 0,
+  eliminated_at timestamptz,
+  state_version integer NOT NULL DEFAULT 1,
+  board jsonb NOT NULL DEFAULT '[]'::jsonb,
+  bench jsonb NOT NULL DEFAULT '[]'::jsonb,
+  shop jsonb NOT NULL DEFAULT '[]'::jsonb,
+  state jsonb,
+  PRIMARY KEY (game_id, session_id),
+  UNIQUE (game_id, seat)
+);
+
+CREATE TABLE IF NOT EXISTS online_game_actions (
+  game_id uuid NOT NULL REFERENCES online_games(id) ON DELETE CASCADE,
+  session_id uuid NOT NULL REFERENCES anonymous_sessions(id),
+  action_id uuid NOT NULL,
+  response jsonb NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (game_id, session_id, action_id)
+);
+
+CREATE INDEX IF NOT EXISTS online_game_actions_player_idx
+  ON online_game_actions(game_id, session_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS online_game_pairings (
+  game_id uuid NOT NULL REFERENCES online_games(id) ON DELETE CASCADE,
+  round integer NOT NULL,
+  pairing_index integer NOT NULL,
+  player_a_id uuid NOT NULL REFERENCES anonymous_sessions(id),
+  player_b_id uuid NOT NULL REFERENCES anonymous_sessions(id),
+  is_ghost boolean NOT NULL DEFAULT false,
+  ghost_owner_id uuid REFERENCES anonymous_sessions(id),
+  seed text NOT NULL,
+  result jsonb,
+  applied_at timestamptz,
+  PRIMARY KEY (game_id, round, pairing_index)
+);
+
+CREATE TABLE IF NOT EXISTS shared_unit_pools (
+  game_id uuid NOT NULL REFERENCES online_games(id) ON DELETE CASCADE,
+  unit_base_id text NOT NULL,
+  initial_count integer NOT NULL CHECK (initial_count >= 0),
+  available_count integer NOT NULL CHECK (available_count >= 0),
+  version integer NOT NULL DEFAULT 1,
+  PRIMARY KEY (game_id, unit_base_id),
+  CHECK (available_count <= initial_count)
+);
+
+CREATE TABLE IF NOT EXISTS online_shop_reservations (
+  game_id uuid NOT NULL REFERENCES online_games(id) ON DELETE CASCADE,
+  session_id uuid NOT NULL REFERENCES anonymous_sessions(id),
+  round integer NOT NULL,
+  slot integer NOT NULL CHECK (slot BETWEEN 0 AND 4),
+  unit_base_id text NOT NULL,
+  purchased boolean NOT NULL DEFAULT false,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (game_id, session_id, round, slot)
+);
+
+CREATE TABLE IF NOT EXISTS online_combat_jobs (
+  game_id uuid NOT NULL REFERENCES online_games(id) ON DELETE CASCADE,
+  round integer NOT NULL,
+  phase_version integer NOT NULL,
+  status text NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING','CALCULATING','COMPLETED')),
+  lease_owner uuid,
+  lease_until timestamptz,
+  attempt_count integer NOT NULL DEFAULT 0,
+  input_checksum text,
+  result_checksum text,
+  last_error text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  completed_at timestamptz,
+  PRIMARY KEY (game_id, round),
+  UNIQUE (game_id, phase_version)
+);
+CREATE INDEX IF NOT EXISTS matchmaking_rooms_status_created_idx ON matchmaking_rooms(status,created_at DESC);
+CREATE INDEX IF NOT EXISTS completed_game_records_ended_idx ON completed_game_records(ended_at DESC);
+
+CREATE TABLE IF NOT EXISTS request_rate_limits (
+  scope_key text NOT NULL,
+  window_bucket bigint NOT NULL,
+  request_count integer NOT NULL CHECK (request_count > 0),
+  expires_at timestamptz NOT NULL,
+  PRIMARY KEY (scope_key, window_bucket)
+);
+CREATE INDEX IF NOT EXISTS request_rate_limits_expiry_idx ON request_rate_limits(expires_at);
